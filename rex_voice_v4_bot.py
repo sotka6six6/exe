@@ -1,7 +1,7 @@
 import os, logging, tempfile, sqlite3, random, json, re, asyncio, time, dataclasses
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     CallbackQueryHandler, filters, ContextTypes
@@ -822,6 +822,60 @@ def get_all_relationships(chat_id):
                  ORDER BY r.heat DESC LIMIT 6""", (chat_id,))
     rows = c.fetchall(); conn.close(); return rows
 
+RELATIONSHIP_DECAY_PER_DAY = 0.4  # насколько остывает "накал" за сутки без стычек
+CONFLICT_DECAY_PER_DAY     = 0.3
+
+def decay_relationships_and_conflicts(chat_id: int = None):
+    """
+    Со временем без новых стычек отношения и конфликты должны
+    остывать, а не висеть "врагами" вечно после одной ссоры месяц
+    назад. Понижает heat/total_heat пропорционально дням простоя и
+    откатывает rel_type обратно к нейтральному, когда накал угас.
+    """
+    import datetime as _dt
+    conn = _connect(); c = conn.cursor()
+    now = _dt.datetime.now()
+
+    where_chat = "WHERE chat_id=?" if chat_id is not None else ""
+    params = (chat_id,) if chat_id is not None else ()
+
+    rows = c.execute(f"""SELECT chat_id,user_id_a,user_id_b,heat,last_updated
+                         FROM user_relationships {where_chat}""", params).fetchall()
+    for cid, ua, ub, heat, last_upd in rows:
+        try:
+            days = max(0.0, (now - _dt.datetime.fromisoformat(last_upd)).total_seconds() / 86400)
+        except Exception:
+            continue
+        if days < 0.5 or heat <= 0:
+            continue
+        new_heat = max(0.0, heat - RELATIONSHIP_DECAY_PER_DAY * days)
+        new_type = "нейтральный" if new_heat < 1.5 else None  # None = не трогать тип
+        if new_type:
+            c.execute("""UPDATE user_relationships SET heat=?,rel_type=?
+                         WHERE chat_id=? AND user_id_a=? AND user_id_b=?""",
+                      (new_heat, new_type, cid, ua, ub))
+        else:
+            c.execute("""UPDATE user_relationships SET heat=?
+                         WHERE chat_id=? AND user_id_a=? AND user_id_b=?""",
+                      (new_heat, cid, ua, ub))
+
+    where_chat2 = "WHERE chat_id=?" if chat_id is not None else ""
+    crows = c.execute(f"""SELECT chat_id,user_id_a,user_id_b,total_heat,last_conflict
+                          FROM conflicts {where_chat2}""", params).fetchall()
+    for cid, ua, ub, heat, last_c in crows:
+        try:
+            days = max(0.0, (now - _dt.datetime.fromisoformat(last_c)).total_seconds() / 86400)
+        except Exception:
+            continue
+        if days < 0.5 or heat <= 0:
+            continue
+        new_heat = max(0.0, heat - CONFLICT_DECAY_PER_DAY * days)
+        c.execute("""UPDATE conflicts SET total_heat=?
+                     WHERE chat_id=? AND user_id_a=? AND user_id_b=?""",
+                  (new_heat, cid, ua, ub))
+
+    conn.commit(); conn.close()
+
 
 # ── Disputes ─────────────────────────────────────────────────────
 
@@ -853,6 +907,27 @@ def get_active_disputes(chat_id, limit=3):
                  WHERE d.chat_id=? AND d.resolved=0
                  ORDER BY d.intensity DESC LIMIT ?""", (chat_id, limit))
     rows = c.fetchall(); conn.close(); return rows
+
+DISPUTE_STALE_HOURS = 20  # если спор не подогревали столько часов — считаем угасшим
+
+def resolve_stale_disputes(chat_id: int = None):
+    """
+    Помечает старые споры как resolved, если по ним давно не было
+    сообщений. Без этого active_disputes только растёт — старые
+    склоки из прошлого месяца иначе вечно всплывают в промпте как
+    актуальные, хотя все давно помирились.
+    """
+    conn = _connect(); c = conn.cursor()
+    import datetime as _dt
+    cutoff_iso = (_dt.datetime.now() - _dt.timedelta(hours=DISPUTE_STALE_HOURS)).isoformat()
+    if chat_id is not None:
+        c.execute("""UPDATE active_disputes SET resolved=1
+                     WHERE chat_id=? AND resolved=0 AND last_message < ?""",
+                  (chat_id, cutoff_iso))
+    else:
+        c.execute("""UPDATE active_disputes SET resolved=1
+                     WHERE resolved=0 AND last_message < ?""", (cutoff_iso,))
+    conn.commit(); conn.close()
 
 
 # ── Chat state ───────────────────────────────────────────────────
@@ -2548,6 +2623,75 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ОБЩАЯ ЛОГИКА ОБРАБОТКИ СООБЩЕНИЯ
 # ════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════
+# АНТИ-ФЛУД / МОДЕРАЦИЯ
+# ════════════════════════════════════════════════════════════════
+# Это отдельная защита от того, что решает brain.py: там — "стоит ли
+# Рексу отвечать на флуд", здесь — "юзер реально спамит чат, надо
+# приструнить", вне зависимости от того, ответил бы бот или нет.
+
+_FLOOD_TRACKER: dict[int, dict[int, list[float]]] = {}
+_FLOOD_WARNED:  dict[tuple, float] = {}   # (chat_id, user_id) -> ts последнего мута/варна
+
+FLOOD_MAX_MSGS      = 6     # сообщений...
+FLOOD_WINDOW_SEC     = 8.0   # ...за столько секунд считаем это спамом
+FLOOD_MUTE_SEC       = 60    # на сколько мутим (если есть права)
+FLOOD_ACTION_COOLDOWN = 30   # не мутим/не варним чаще раза в N секунд
+
+_FLOOD_MUTE_PHRASES = [
+    "Всё, ты в муте на минуту. Флудишь как больной.",
+    "Заткнул тебя на минуту. Остынь и подумай о своей жизни.",
+    "Многовато букв в единицу времени. Мут на 60 секунд.",
+    "Захлебнулся своим потоком сознания — мут.",
+]
+_FLOOD_WARN_PHRASES = [
+    "Полегче с сообщениями, а то замучу.",
+    "Ты как из пулемёта строчишь. Притормози.",
+    "Ещё немного и я тебя заткну физически.",
+]
+
+async def check_flood(update: Update, context, chat_id: int, user_id: int) -> bool:
+    """
+    Трекает частоту сообщений юзера в чате. Если превышен лимит —
+    пробует замутить (если у бота есть права админа), иначе просто
+    предупреждает текстом. Возвращает True, если сообщение нужно
+    полностью проигнорировать (не гонять через LLM/анализ).
+    """
+    now = time.time()
+    bucket = _FLOOD_TRACKER.setdefault(chat_id, {}).setdefault(user_id, [])
+    bucket.append(now)
+    cutoff = now - FLOOD_WINDOW_SEC
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+
+    if len(bucket) <= FLOOD_MAX_MSGS:
+        return False
+
+    key = (chat_id, user_id)
+    last_action = _FLOOD_WARNED.get(key, 0.0)
+    if now - last_action < FLOOD_ACTION_COOLDOWN:
+        return True  # уже реагировали недавно — молча игнорим дальше
+
+    _FLOOD_WARNED[key] = now
+    muted = False
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id, user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=int(now + FLOOD_MUTE_SEC),
+        )
+        muted = True
+    except Exception as e:
+        logger.debug(f"[FLOOD] нет прав замутить {user_id} в {chat_id}: {e}")
+
+    try:
+        phrase = random.choice(_FLOOD_MUTE_PHRASES if muted else _FLOOD_WARN_PHRASES)
+        await update.message.reply_text(phrase)
+    except Exception:
+        pass
+    return True
+
+
 async def process_message(update: Update, context, user, chat,
                           text: str, is_voice_input: bool = False):
     is_group = chat.type in ("group", "supergroup")
@@ -2578,6 +2722,10 @@ async def process_message(update: Update, context, user, chat,
     register_member(chat.id, user.id, _display, user.username)
     get_or_create_user(user.id, user.username, _display)
     increment_messages(user.id)
+
+    # Анти-флуд: если юзер спамит — мутим/варним и не тратим LLM на это
+    if await check_flood(update, context, chat.id, user.id):
+        return
 
     # Самообучение: это следующее сообщение чата после ответа бота?
     # Если да — трактуем как реакцию на этот ответ (смех/агрессия/тишина и т.д.)
@@ -3148,7 +3296,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── ГРУППА: транскрибируем голосовое ────────────────────────
+    # ── ГРУППА: транскрибируем голосовое, дальше — общий пайплайн ──
+    # (раньше здесь была отдельная копия всей логики process_message —
+    # с багом: ссылалась на sender_name/text/directed_at_bot, которых
+    # в этой функции не существовало, так что любое голосовое падало
+    # с NameError сразу после анализа. Теперь голосовые идут через
+    # тот же process_message, что и текст: одинаковая обработка флуда,
+    # конфликтов, памяти, дедупликации и отката на текст при ошибке.)
     await update.message.chat.send_action("record_voice")
     try:
         from io import BytesIO
@@ -3157,129 +3311,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await vf_tg.download_to_memory(ogg_buf)
         ogg_buf.seek(0)
         ogg_buf.name = "voice.ogg"  # Whisper требует имя файла
-        transcription = client.audio.transcriptions.create(
+        transcription = await asyncio.to_thread(
+            client.audio.transcriptions.create,
             model="whisper-large-v3", file=ogg_buf, language="ru")
         user_text = transcription.text.strip()
     except Exception as e:
-        user_text = ""; logger.error(f"STT: {e}")
+        user_text = ""
+        logger.error(f"STT: {e}")
 
     if not user_text:
         return  # не удалось транскрибировать — молчим
 
-    # ── Brain анализирует голосовое так же как текстовое ────────
-    _display = get_display_name(user.id, user.first_name, user.username)
-    register_member(chat.id, user.id, _display, user.username)
-    get_or_create_user(user.id, user.username, _display)
-    increment_messages(user.id)
+    if chat.type in ("group", "supergroup"):
+        _LAST_CHAT_MSG[chat.id] = time.time()
 
-    bot_info  = await context.bot.get_me()
-    bot_username = bot_info.username or ""
-    bot_name_str = bot_info.first_name or ""
-
-    chat_context = get_recent_chat_messages(chat.id, limit=8)
-    pre_state    = get_chat_state(chat.id)
-    known_names  = [get_display_name(uid, fn, un) for uid, fn, un in get_members(chat.id)]
-
-    # LLM анализ транскрипта (в отдельном потоке — сетевой вызов синхронный)
-    analysis = await asyncio.to_thread(
-        deep_analyze,
-        text=user_text, chat_id=chat.id, user_name=_display,
-        chat_context=chat_context, known_names=known_names,
-        bot_names=list({"есет","eset","бот"} | {bot_username.lower()}),
-        chat_state=pre_state,
-    )
-    sentiment   = analysis.get("sentiment", 0.0)
-    aggression  = analysis.get("aggression", 0.0)
-    emotionality= analysis.get("emotionality", 0.5)
-    topic       = analysis.get("topic", "другое")
-    subtopic    = analysis.get("subtopic", "")
-    intent      = analysis.get("intent", "")
-
-    update_user_profile(user.id, sentiment, aggression, topic)
-    update_bot_attitude(user.id, sentiment, aggression,
-                        analysis.get('directed_at_bot', False), text=user_text)
-    save_message(user.id, chat.id, "user",
-                 f"{_display} (голосовое): {user_text}",
-                 sentiment=sentiment, aggression=aggression,
-                 topic=topic, subtopic=subtopic, intent=intent,
-                 emotionality=emotionality)
-
-    heat = aggression * 0.6 + emotionality * 0.4
-    update_chat_state(chat.id, topic, heat, replied=False)
-
-    # Долгосрочная память: записываем значимые события сразу
-    if topic in ("угроза",) and aggression > 0.6:
-        save_long_memory(chat.id, user.id, "threat",
-                         f"{sender_name}: {text[:120]}", [user.id], heat=0.9)
-    elif topic in ("похвала",) and sentiment > 0.5:
-        save_long_memory(chat.id, user.id, "praise",
-                         f"{sender_name} сказал хорошее: {text[:80]}", [user.id], heat=0.2)
-    # Личные оскорбления бота — запоминаем как "обиды"
-    if directed_at_bot and aggression > 0.55 and len(text) > 5:
-        save_long_memory(chat.id, user.id, "обида",
-                         f"{sender_name} сказал боту: «{text[:100]}»",
-                         [user.id], heat=aggression)
-    chat_state = get_chat_state(chat.id)
-
-    # Brain решает — отвечать или нет
-    brain    = get_brain()
-    decision = brain.process(
-        chat_id      = chat.id,
-        text         = user_text,
-        user_id      = user.id,
-        user_name    = _display,
-        update       = update,
-        bot_username = bot_username,
-        bot_name     = bot_name_str,
-        chat_state   = chat_state,
-        is_group     = True,
-        settings     = build_settings(
-            get_setting("active"),
-            get_setting("aggro_mode"),
-            get_setting("conflict_sens"),
-            BOT_MODE.get("silent", False),
-        ),
-        llm_analysis = analysis,
-    )
-
-    logger.info(f"[VOICE BRAIN {chat.id}] {_display} → "
-                f"{'✅' if decision.should_respond else '❌'} "
-                f"[{decision.mode}] {decision.reason}")
-
-    if not decision.should_respond:
-        return
-
-    user_info     = get_user_info(user.id)
-    members       = get_members(chat.id)
-    top_conflicts = get_top_conflicts(chat.id)
-    all_rels      = get_all_relationships(chat.id)
-    disputes      = get_active_disputes(chat.id)
-    users_sum     = get_all_users_summary(chat.id)
-    notes         = user_info[6] if user_info else ""
-
-    reply = await asyncio.to_thread(
-        ask_rex,
-        user_text, _display, user.id, chat.id, True,
-        members, notes, user_info is None, analysis,
-        chat_context, chat_state, user_info, top_conflicts,
-        all_relationships=all_rels,
-        active_disputes_list=disputes,
-        users_summary=users_sum,
-        respond_mode=decision.mode,
-        context_summary=decision.context_summary,
-        dialogue_summary=getattr(decision, 'dialogue_summary', ''),
-    )
-    if not reply:
-        logger.info("  → [пропуск: LLM недоступен]")
-        return
-
-    brain.record_bot_reply(chat.id, reply_text=reply)
-    analyzer_record_reply(chat.id, reply)
-    save_message(user.id, chat.id, "assistant", reply)
-    update_chat_state(chat.id, topic, heat, replied=True)
-
-    _heat_v = float(pre_state[3]) if pre_state and len(pre_state) > 3 else 0.0
-    await send_reply(update, reply, mode=decision.mode, heat=_heat_v)
+    await process_message(update, context, user, chat, user_text, is_voice_input=True)
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members: return
@@ -3358,9 +3404,25 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.warning(f"[AUTO_PROVOKE] loop error: {e}")
 
+    async def memory_maintenance_loop(app):
+        """
+        Раз в час остужаем старые конфликты/отношения и закрываем
+        споры, по которым давно не было сообщений — иначе память
+        только растёт и Рекс вечно припоминает склоки месячной давности.
+        """
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                resolve_stale_disputes()
+                decay_relationships_and_conflicts()
+                logger.info("[MEMORY] остывание конфликтов/отношений выполнено")
+            except Exception as e:
+                logger.warning(f"[MEMORY] ошибка обслуживания памяти: {e}")
+
     async def on_startup(app):
         asyncio.create_task(auto_provoke_loop(app))
         asyncio.create_task(weekly_rating_loop(app))
+        asyncio.create_task(memory_maintenance_loop(app))
         asyncio.create_task(learner_loop(DB_PATH, client, "llama-3.3-70b-versatile"))
 
     app.post_init = on_startup
