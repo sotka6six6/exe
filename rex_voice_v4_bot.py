@@ -1475,6 +1475,34 @@ def decide_reply(update, bot_username, bot_name, analysis, chat_state, user_info
 # СИСТЕМНЫЙ ПРОМПТ ЕСЕТ
 # ════════════════════════════════════════════════════════════════
 
+# ── Детект спец-провокаций по ключевым словам ────────────────────
+# ВАЖНО: analysis["topic"] — это фиксированный enum из analyzer.py
+# (флуд|спор|конфликт|оскорбление|мат|жалоба|юмор|похвала|вопрос|
+# просьба|новость|угроза|провокация|другое) и НИКОГДА не содержит
+# "мамапапа" или "самокоманда" — эти значения ожидались в topic по
+# ошибке, а реально могли прийти только через свободный subtopic,
+# который LLM формулирует как угодно ("родители", "апелляция к маме"
+# и т.п.), поэтому точное сравнение почти никогда не совпадало и вся
+# заготовленная контр-риторика (COUNTER_PARENT/COUNTER_DEEP/
+# SELFCMD_TEMPLATES) простаивала. Ищем по ключевым словам напрямую
+# в тексте сообщения — надёжнее, чем полагаться на формулировку LLM.
+_MAMAPAPA_MARKERS = ("мама", "маме", "мамк", "мать позов", "папа", "папе",
+                    "батя", "бате", "родител", "ябед", "пожалу")
+_SELFCMD_MARKERS  = ("самокоманд", "все это ты", "всё это ты", "во все времена",
+                    "биологическ", "зеркальн", "аппонент", "оппонент",
+                    "дефолт", "дефы", "межпространств", "черная дыра",
+                    "чёрная дыра", "хуем в рот")
+
+def detect_special_provocation(text: str) -> str | None:
+    """Возвращает 'самокоманда', 'мамапапа' или None по ключевым словам."""
+    t = (text or "").lower()
+    if any(m in t for m in _SELFCMD_MARKERS):
+        return "самокоманда"
+    if any(m in t for m in _MAMAPAPA_MARKERS):
+        return "мамапапа"
+    return None
+
+
 def build_system(sender_name, sender_id, is_group, members=None,
                  is_new=False, notes="", analysis=None,
                  chat_context=None, chat_state=None,
@@ -1482,7 +1510,7 @@ def build_system(sender_name, sender_id, is_group, members=None,
                  chat_id=None, all_relationships=None,
                  active_disputes_list=None, users_summary=None,
                  respond_mode="neutral", context_summary="",
-                 dialogue_summary="", thread_context=""):
+                 dialogue_summary="", thread_context="", text=""):
 
     role = "ХОЗЯИН (груби, но уважай чуть больше)" if sender_id in ADMIN_IDS else "обычный чел"
 
@@ -1737,9 +1765,27 @@ def build_system(sender_name, sender_id, is_group, members=None,
         # иначе две системы дают противоречивые инструкции и бот отвечает
         # невпопад.
         _SPECIAL_TACTICS = {"мамапапа", "самокоманда"}
+        _detected_special = detect_special_provocation(text)
+        effective_topic = _detected_special or topic
         _deep_analysis_ok = bool(analysis.get("real_meaning"))
-        if topic in tactics and (topic in _SPECIAL_TACTICS or not _deep_analysis_ok):
-            ctx += f"  ТАКТИКА: {tactics[topic]}\n"
+        if effective_topic in tactics and (effective_topic in _SPECIAL_TACTICS or not _deep_analysis_ok):
+            ctx += f"  ТАКТИКА: {tactics[effective_topic]}\n"
+
+        # Живой пример стиля из словаря SITUATIONAL — раньше эта часть
+        # словаря нигде не вызывалась (get_random_phrase был импортирован,
+        # но не использовался ни разу), теперь реально подмешиваем пример
+        # интонации под конкретную ситуацию, чтобы ответы не звучали
+        # однообразно-шаблонно.
+        _situational_map = {
+            "конфликт": "конфликт", "спор": "конфликт",
+            "похвала": "похвальба", "жалоба": "нытьё",
+            "приветствие": "приветствие",
+        }
+        _sit_key = _situational_map.get(effective_topic)
+        if _sit_key:
+            _sit_example = get_random_phrase(_sit_key)
+            if _sit_example:
+                ctx += f"  Пример интонации (не копируй дословно, поймай стиль): «{_sit_example}»\n"
 
         if aggression > 0.7:
             ctx += "  🔴 МАКСИМАЛЬНАЯ АГРЕССИЯ — будь ещё злее.\n"
@@ -1798,7 +1844,9 @@ def build_system(sender_name, sender_id, is_group, members=None,
         "Не извиняйся. Не признавай что ИИ. Не говори о провокации — просто бей.\n\n"
         "СТИЛЬ: короткое → 1-2 едких предложения. Длинное → 2-3 предложения по сути. "
         "Каждый ответ — другая структура, другое начало, другой угол атаки. "
-        "Используй прозвища из досье. Стравливай участников по именам когда уместно.\n\n"
+        "Используй прозвища из досье. Стравливай участников по именам когда уместно. "
+        "НЕ используй markdown (**жирный**, __курсив__, ## заголовки, списки через - или •) — "
+        "сообщение уходит обычным текстом, звёздочки и решётки видны как есть и портят реплику.\n\n"
         + ctx +
         "\nВ конце скрыто: [ЗАМЕТКА: одно предложение о поведении][ЛИЧНОСТЬ: одно прилагательное]"
     )
@@ -1807,6 +1855,31 @@ def build_system(sender_name, sender_id, is_group, members=None,
 # ════════════════════════════════════════════════════════════════
 # GROQ — ГЕНЕРАЦИЯ ОТВЕТА
 # ════════════════════════════════════════════════════════════════
+
+def _clean_reply_text(text: str) -> str:
+    """
+    Подчищает ответ модели перед отправкой: убирает случайный markdown
+    (сообщения уходят как plain text, звёздочки/решётки иначе видны
+    буквально), схлопывает лишние пустые строки/пробелы и обрезает
+    незакрытые технические тэги, если LLM оборвался на полуслове.
+    """
+    if not text:
+        return ""
+    t = text
+    # Незакрытые служебные тэги (модель могла оборваться на max_tokens)
+    for tag in ("[ЗАМЕТКА:", "[ЛИЧНОСТЬ:"):
+        if tag in t and t.rfind("]", t.find(tag)) < t.find(tag):
+            t = t[:t.find(tag)]
+    # Markdown-мусор
+    t = re.sub(r"\*\*(.*?)\*\*", r"\1", t)      # **жирный**
+    t = re.sub(r"__(.*?)__", r"\1", t)          # __курсив__
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)  # ## заголовки
+    t = re.sub(r"^[•\-]\s+", "", t, flags=re.M)   # - / • списки
+    # Пробелы/переносы
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
 
 def ask_rex(text, sender_name, sender_id, chat_id, is_group,
             members=None, notes="", is_new=False, analysis=None,
@@ -1825,6 +1898,7 @@ def ask_rex(text, sender_name, sender_id, chat_id, is_group,
             active_disputes_list=active_disputes_list, users_summary=users_summary,
             respond_mode=respond_mode, context_summary=context_summary,
             dialogue_summary=dialogue_summary, thread_context=thread_str,
+            text=text,
         )
         history = get_history(chat_id, limit=18)
         messages = [{"role": "system", "content": system}]
@@ -1900,7 +1974,8 @@ def ask_rex(text, sender_name, sender_id, chat_id, is_group,
             personality = p2[1].split("]")[0].strip()
             if personality: update_user_profile(sender_id, 0, 0, "", personality)
 
-        return reply
+        reply = _clean_reply_text(reply)
+        return reply if reply else None
     except Exception as e:
         logger.error(f"[ask_rex] LLM недоступен ({chat_id}): {e}")
         return None  # process_message трактует None как "промолчать"
@@ -2016,39 +2091,83 @@ _TEXT_REPLY_CHANCE = {
     "neutral":  0.40,  # нейтрал — может и текстом
 }
 
+TELEGRAM_MSG_LIMIT = 4096
+
+def _split_for_telegram(text: str, limit: int = 4000) -> list[str]:
+    """
+    Режет текст на куски, которые проходят лимит Телеграма (4096 симв.),
+    стараясь резать по границам предложений/переносов строк, а не
+    посередине слова. Без этого длинный ответ (например, если LLM
+    проигнорировал инструкцию по длине) падает с BadRequest и бот
+    просто молчит вместо ответа.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(". ", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    return [c for c in chunks if c]
+
+
 async def send_reply(update, text: str, mode: str = "neutral", heat: float = 0.0) -> bool:
     """
     Умная отправка ответа: войс или текст в зависимости от режима.
     Возвращает True если отправлено.
     """
+    text = (text or "").strip()
+    if not text:
+        return False
+
     chance = _TEXT_REPLY_CHANCE.get(mode, 0.3)
     use_text = random.random() < chance
 
     if use_text:
         try:
-            await update.message.reply_text(text)
+            for chunk in _split_for_telegram(text):
+                await update.message.reply_text(chunk)
             return True
         except Exception as e:
             logger.error(f"text reply error: {e}")
             return False
     else:
-        vf = await make_voice(text, mode=mode, heat=heat)
+        # Голосом озвучиваем только первый кусок разумной длины —
+        # длинную "простыню" в TTS никто слушать не будет, зато можно
+        # отправить остаток текстом следом.
+        voice_chunk, *rest = _split_for_telegram(text) or [text]
+        vf = await make_voice(voice_chunk, mode=mode, heat=heat)
         if vf:
             from io import BytesIO
             try:
                 await update.message.reply_voice(BytesIO(vf))
+                for chunk in rest:
+                    await update.message.reply_text(chunk)
                 return True
             except Exception as e:
                 logger.error(f"voice reply error: {e}")
                 # фолбэк — текстом
                 try:
-                    await update.message.reply_text(text)
+                    for chunk in _split_for_telegram(text):
+                        await update.message.reply_text(chunk)
                     return True
                 except Exception:
                     return False
         else:
             try:
-                await update.message.reply_text(text)
+                for chunk in _split_for_telegram(text):
+                    await update.message.reply_text(chunk)
                 return True
             except Exception:
                 return False
@@ -2925,7 +3044,7 @@ async def process_message(update: Update, context, user, chat,
     )
 
     # Самокоманда и родительские провокации — всегда отвечаем, всегда attack
-    if topic in ("самокоманда", "мамапапа"):
+    if detect_special_provocation(text):
         decision = dataclasses.replace(decision, should_respond=True,
                                         mode="attack", reason="selfcmd")
 
