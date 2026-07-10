@@ -33,7 +33,8 @@ except Exception as _vocab_err:
     def detect_attitude_signal(text): return 0.0, 0.0
 
 from brain import get_brain, build_settings
-from analyzer import init_analyzer, deep_analyze, record_bot_reply as analyzer_record_reply, build_response_instructions
+from analyzer import (init_analyzer, deep_analyze, record_bot_reply as analyzer_record_reply,
+                       build_response_instructions, get_semantic_memory)
 from learner import (record_reaction, detect_reaction, save_bot_reply_for_learning,
                       learner_loop, get_ai_provocation)
 load_dotenv()
@@ -170,6 +171,7 @@ _REPLIED_HASHES: dict[int, deque] = {}
 
 # Последний ответ бота в каждом чате — для learner.py (реакция чата на ответ)
 _LAST_BOT_REPLY: dict[int, dict] = {}
+_NICKNAME_IN_PROGRESS: set[int] = set()
 _REACTION_WINDOW = 180.0  # сек — сколько ждём реакцию на последний ответ бота
 
 def _is_duplicate(chat_id: int, text: str, window: int = 3) -> bool:
@@ -1653,7 +1655,15 @@ def build_system(sender_name, sender_id, is_group, members=None,
                 "перещеголяй в КРЕАТИВНОСТИ, раз уж так общаетесь." if attitude_score > 0.5
                 else "перещеголяй и унизь.")),
         }
-        if topic in tactics:
+        # Спец-тактики с заготовленными контр-фразами (мамапапа/самокоманда)
+        # применяем всегда — это уникальные заготовки, их не дублирует
+        # умный анализатор ниже. Остальные общие тактики (конфликт, вопрос,
+        # юмор и т.д.) применяем ТОЛЬКО если глубокий анализ не сработал —
+        # иначе две системы дают противоречивые инструкции и бот отвечает
+        # невпопад.
+        _SPECIAL_TACTICS = {"мамапапа", "самокоманда"}
+        _deep_analysis_ok = bool(analysis.get("real_meaning"))
+        if topic in tactics and (topic in _SPECIAL_TACTICS or not _deep_analysis_ok):
             ctx += f"  ТАКТИКА: {tactics[topic]}\n"
 
         if aggression > 0.7:
@@ -1766,15 +1776,41 @@ def ask_rex(text, sender_name, sender_id, chat_id, is_group,
         messages.append({"role": "user", "content": user_content})
 
         _temp = round(random.uniform(0.95, 1.15), 2)  # джиттер температуры
-        resp = _llm_call_with_retry(lambda: client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=350,
-            temperature=_temp
-        ))
+
+        def _gen(extra_system: str = "", temp_bump: float = 0.0):
+            msgs = list(messages)
+            if extra_system:
+                msgs[0] = {"role": "system", "content": msgs[0]["content"] + "\n\n" + extra_system}
+            return _llm_call_with_retry(lambda: client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=msgs,
+                max_tokens=350,
+                temperature=min(_temp + temp_bump, 1.5),
+            ))
+
+        resp = _gen()
         if resp is None:
             return None  # rate limit — молчим тихо
         full = resp.choices[0].message.content
+
+        # Проверка на повтор — не полагаемся только на мягкую инструкцию
+        # в промпте, а реально сверяем с недавними ответами и, если похоже,
+        # пробуем сгенерировать ещё раз с явным запретом.
+        try:
+            mem = get_semantic_memory(chat_id or 0)
+            candidate_check = full.split("[ЗАМЕТКА:")[0].split("[ЛИЧНОСТЬ:")[0].strip()
+            if mem.bot_reply_too_similar(candidate_check):
+                resp2 = _gen(
+                    extra_system="ВАЖНО: твой предыдущий вариант ответа слишком похож на "
+                                 "то, что ты уже говорил в этом чате. Придумай ДРУГОЙ угол, "
+                                 "другие слова, другую структуру предложения.",
+                    temp_bump=0.2,
+                )
+                if resp2 is not None:
+                    full = resp2.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"[ask_rex] anti-repeat check failed: {e}")
+
         reply = full
 
         if "[ЗАМЕТКА:" in full:
@@ -2297,9 +2333,11 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ev_str += f"  {e['date']} {e['summary'][:60]}\n"
 
     display = get_display_name(user.id, user.first_name, user.username)
+    nickname = get_nickname(user.id)
     txt = (
         f"🧠 *Досье: {display}*\n\n"
-        f"💬 Сообщений: {msg_cnt}\n"
+        + (f"🏷 Кличка: *{nickname}*\n" if nickname else "🏷 Кличка: _ещё не придумал, пиши больше_\n")
+        + f"💬 Сообщений: {msg_cnt}\n"
         f"😤 Агрессия: {(aggr or 0):.2f}\n"
         f"🎭 Настрой: {mood_str}\n"
         f"📌 Любимая тема: {fav}\n"
@@ -2356,6 +2394,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_voice(BytesIO(vf))
         else:
             await update.message.reply_text(text)
+
+async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/nick — какую кличку бот дал тебе (или тому, на чьё сообщение ты ответил)."""
+    user = update.effective_user
+    if not user:
+        return
+
+    target = user
+    target_display = get_display_name(user.id, user.first_name or "", user.username or "")
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target = update.message.reply_to_message.from_user
+        target_display = get_display_name(target.id, target.first_name or "", target.username or "")
+
+    nick = get_nickname(target.id)
+    if nick:
+        await update.message.reply_text(f"{target_display} — «{nick}». Заслужил(а).")
+    else:
+        info = get_user_info(target.id)
+        msg_cnt = (info[6] or 0) if info else 0
+        if msg_cnt < 3:
+            await update.message.reply_text(
+                f"{target_display}, я тебя ещё не распознал толком — пиши больше, кличку заслужишь."
+            )
+        else:
+            await update.message.reply_text(f"{target_display}, кличку ещё не придумал. Пока.")
+
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -2526,14 +2590,34 @@ async def process_message(update: Update, context, user, chat,
         except Exception as e:
             logger.debug(f"[LEARN] не удалось зафиксировать реакцию: {e}")
 
-    # Генерируем прозвище при 3-м сообщении (в фоне)
+    # Генерируем прозвище после 3-го сообщения (в фоне), с защитой от
+    # повторного запуска пока первая попытка ещё выполняется
     _uinfo_pre = get_user_info(user.id)
-    if _uinfo_pre and (_uinfo_pre[6] or 0) == 3 and not get_nickname(user.id):
-        asyncio.create_task(maybe_generate_nickname(
-            user.id, _display,
-            personality=_uinfo_pre[11] if len(_uinfo_pre) > 11 else "",
-            notes=_uinfo_pre[7] if len(_uinfo_pre) > 7 else ""
-        ))
+    _msg_cnt_pre = (_uinfo_pre[6] or 0) if _uinfo_pre else 0
+    if (_uinfo_pre and _msg_cnt_pre >= 3
+            and not get_nickname(user.id)
+            and user.id not in _NICKNAME_IN_PROGRESS):
+        _NICKNAME_IN_PROGRESS.add(user.id)
+
+        async def _gen_and_announce():
+            try:
+                nick = await maybe_generate_nickname(
+                    user.id, _display,
+                    personality=_uinfo_pre[11] if len(_uinfo_pre) > 11 else "",
+                    notes=_uinfo_pre[7] if len(_uinfo_pre) > 7 else ""
+                )
+                if nick:
+                    try:
+                        await context.bot.send_message(
+                            chat.id,
+                            f"так, {_display}, с этого момента ты для меня — «{nick}». привыкай.",
+                        )
+                    except Exception:
+                        pass
+            finally:
+                _NICKNAME_IN_PROGRESS.discard(user.id)
+
+        asyncio.create_task(_gen_and_announce())
 
     sender_name = _display
 
@@ -3242,7 +3326,7 @@ async def error_handler(update, context):
 if __name__ == "__main__":
     init_db()
     check_groq_connection()  # покажет причину, если LLM недоступен
-    init_analyzer(client)  # глубокий анализ
+    init_analyzer(client, db_path=DB_PATH)  # глубокий анализ + персистентная память
     print("Есет v5 запущен 🐕")
     app = ApplicationBuilder().token(TG_TOKEN).build()
 
@@ -3286,6 +3370,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("stats",  cmd_stats))
     app.add_handler(CommandHandler("me",     cmd_me))
+    app.add_handler(CommandHandler("nick",   cmd_nick))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^adm_"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -16,6 +16,7 @@ import re
 import time
 import hashlib
 import logging
+import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -63,6 +64,84 @@ class DeepAnalysis:
 
 
 # ════════════════════════════════════════════════════════════════
+# ПЕРСИСТЕНТНОСТЬ — чтобы память не терялась при рестарте/редеплое
+# ════════════════════════════════════════════════════════════════
+
+_DB_PATH: Optional[str] = None
+
+
+def set_memory_db_path(db_path: str):
+    """
+    Подключить SQLite для хранения семантической памяти между рестартами.
+    Вызвать один раз при старте бота (из init_analyzer или отдельно),
+    передав тот же DB_PATH, что использует основной бот (учитывает
+    Railway Volume автоматически, если он настроен).
+    """
+    global _DB_PATH
+    _DB_PATH = db_path
+    try:
+        conn = sqlite3.connect(_DB_PATH, timeout=10.0)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS semantic_memory (
+                chat_id       INTEGER PRIMARY KEY,
+                bot_phrases   TEXT,
+                bot_meanings  TEXT,
+                human_topics  TEXT,
+                updated_at    REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("[analyzer] Персистентная память подключена: %s", _DB_PATH)
+    except Exception as e:
+        logger.warning(f"[analyzer] Не удалось инициализировать таблицу памяти: {e}")
+        _DB_PATH = None
+
+
+def _load_memory_row(chat_id: int) -> Optional[dict]:
+    if not _DB_PATH:
+        return None
+    try:
+        conn = sqlite3.connect(_DB_PATH, timeout=10.0)
+        row = conn.execute(
+            "SELECT bot_phrases, bot_meanings, human_topics FROM semantic_memory WHERE chat_id=?",
+            (chat_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "bot_phrases":  json.loads(row[0]) if row[0] else [],
+            "bot_meanings": json.loads(row[1]) if row[1] else [],
+            "human_topics": json.loads(row[2]) if row[2] else [],
+        }
+    except Exception as e:
+        logger.warning(f"[analyzer] Не удалось загрузить память чата {chat_id}: {e}")
+        return None
+
+
+def _save_memory_row(chat_id: int, bot_phrases: list, bot_meanings: list, human_topics: list):
+    if not _DB_PATH:
+        return
+    try:
+        conn = sqlite3.connect(_DB_PATH, timeout=10.0)
+        conn.execute("""
+            INSERT INTO semantic_memory (chat_id, bot_phrases, bot_meanings, human_topics, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                bot_phrases=excluded.bot_phrases,
+                bot_meanings=excluded.bot_meanings,
+                human_topics=excluded.human_topics,
+                updated_at=excluded.updated_at
+        """, (chat_id, json.dumps(bot_phrases[-30:]), json.dumps(bot_meanings[-15:]),
+              json.dumps(human_topics[-20:]), time.time()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"[analyzer] Не удалось сохранить память чата {chat_id}: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
 # СЕМАНТИЧЕСКАЯ ПАМЯТЬ — антиповтор
 # ════════════════════════════════════════════════════════════════
 
@@ -82,11 +161,38 @@ class SemanticMemory:
     Позволяет боту не повторяться и понимать повторы от людей.
     """
 
-    def __init__(self, maxlen: int = 60):
+    def __init__(self, maxlen: int = 60, chat_id: Optional[int] = None):
         self._entries: deque[SemanticEntry] = deque(maxlen=maxlen)
         # Последние N смыслов ответов бота — для антиповтора
         self._bot_meanings: deque[str] = deque(maxlen=15)
         self._bot_phrases:  deque[str] = deque(maxlen=30)  # конкретные фразы
+        # Темы/смыслы людей — переживают дольше, чем окно _entries,
+        # чтобы бот мог "вспомнить" и подколоть чем-то из позавчера
+        self._human_topics: deque[str] = deque(maxlen=20)
+        self.chat_id = chat_id
+        if chat_id is not None:
+            self._load()
+
+    def _load(self):
+        """Подтягивает сохранённую память из БД (если есть) при первом обращении к чату."""
+        row = _load_memory_row(self.chat_id)
+        if not row:
+            return
+        for p in row.get("bot_phrases", []):
+            self._bot_phrases.append(p)
+        for m in row.get("bot_meanings", []):
+            self._bot_meanings.append(m)
+        for t in row.get("human_topics", []):
+            self._human_topics.append(t)
+
+    def _persist(self):
+        if self.chat_id is not None:
+            _save_memory_row(
+                self.chat_id,
+                list(self._bot_phrases),
+                list(self._bot_meanings),
+                list(self._human_topics),
+            )
 
     def add_human(self, text: str, meaning: str):
         fp = self._fingerprint(text)
@@ -94,6 +200,9 @@ class SemanticMemory:
             text=text, meaning=meaning,
             fingerprint=fp, timestamp=time.time(), is_bot=False
         ))
+        if meaning and meaning.strip():
+            self._human_topics.append(meaning.strip())
+        self._persist()
 
     def add_bot(self, text: str, meaning: str = ""):
         fp = self._fingerprint(text)
@@ -105,6 +214,21 @@ class SemanticMemory:
         # Сохраняем ключевые фразы (начала предложений, устойчивые выражения)
         for phrase in self._extract_phrases(text):
             self._bot_phrases.append(phrase)
+        self._persist()
+
+    def bot_reply_too_similar(self, candidate: str, threshold: float = 0.6) -> bool:
+        """
+        Нечёткая проверка: похож ли новый ответ бота (по смыслу/словам)
+        на один из недавних. В отличие от bot_already_said (точное
+        совпадение), это ловит перефразы одного и того же прикола.
+        """
+        for prev in list(self._bot_meanings) + list(self._entries):
+            prev_text = prev if isinstance(prev, str) else (prev.meaning if prev.is_bot else None)
+            if not prev_text:
+                continue
+            if self._semantic_overlap(candidate, prev_text) >= threshold:
+                return True
+        return False
 
     def is_human_repeating(self, text: str, meaning: str,
                             window: int = 10) -> bool:
@@ -135,8 +259,7 @@ class SemanticMemory:
         return list(self._bot_meanings)[-n:]
 
     def get_recent_human_topics(self, n: int = 8) -> list[str]:
-        entries = [e for e in list(self._entries)[-n:] if not e.is_bot]
-        return [e.meaning for e in entries if e.meaning]
+        return list(self._human_topics)[-n:]
 
     # ── Внутренние утилиты ───────────────────────────────────────
 
@@ -172,7 +295,7 @@ _semantic_memories: dict[int, SemanticMemory] = {}
 
 def get_semantic_memory(chat_id: int) -> SemanticMemory:
     if chat_id not in _semantic_memories:
-        _semantic_memories[chat_id] = SemanticMemory()
+        _semantic_memories[chat_id] = SemanticMemory(chat_id=chat_id)
     return _semantic_memories[chat_id]
 
 
@@ -497,6 +620,15 @@ class ResponseInstructor:
         if avoid_lines:
             lines.append(f"НЕ ПОВТОРЯЙ ЭТИ ФРАЗЫ И СМЫСЛЫ: {' | '.join(avoid_lines)}")
 
+        # Каллбэки — о чём говорили раньше, можно подъебнуть в тему
+        recent_topics = [t for t in mem.get_recent_human_topics(6) if t]
+        if recent_topics:
+            lines.append(
+                "НЕДАВНИЕ ТЕМЫ ЧАТА (если в тему — сделай каллбэк, "
+                "напомни/подъебни; если не в тему — игнорируй): "
+                + " | ".join(recent_topics)
+            )
+
         # Режим
         mode_map = {
             "attack":   "РЕЖИМ АТАКИ — жёстко, лично, с матом, без жалости",
@@ -520,10 +652,12 @@ class ResponseInstructor:
 _analyzer: Optional[DeepAnalyzer] = None
 _instructor = ResponseInstructor()
 
-def init_analyzer(client, model: str = "llama-3.3-70b-versatile"):
+def init_analyzer(client, model: str = "llama-3.3-70b-versatile", db_path: Optional[str] = None):
     """Инициализировать анализатор с клиентом Groq. Вызвать при старте бота."""
     global _analyzer
     _analyzer = DeepAnalyzer(client=client, model=model)
+    if db_path:
+        set_memory_db_path(db_path)
     logger.info("[analyzer] DeepAnalyzer инициализирован")
 
 def get_analyzer() -> Optional[DeepAnalyzer]:
