@@ -819,6 +819,14 @@ class DecisionEngine:
         if not settings.get("active", True):
             return True, "бот_выключен"
 
+        # Прямое обращение (mention/reply-боту/имя-бота-в-тексте) — считаем
+        # везде ниже единообразно. Раньше это учитывалось только в
+        # тихом режиме и в проверках диалогового контекста, а
+        # "не_надоедать" и "быстрый_поток_флуд" его игнорировали —
+        # из-за этого прямой ответ пользователя боту сразу после его
+        # реплики или во время быстрого потока молча проглатывался.
+        direct = sig.has_bot_name or sig.has_mention or sig.has_reply_bot
+
         # Чистый флуд без агрессии и без обращения
         if (sig.is_flood and sig.aggression < 0.1
                 and not sig.has_bot_name and not sig.has_mention
@@ -841,21 +849,20 @@ class DecisionEngine:
                 return True, "тихий_режим"
 
         # Бот уже недавно говорил и его проигнорировали — не надоедать
-        if ctx.rex_last_spoke <= 3 and ctx.rex_ignored == 0 and sig.aggression < 0.5:
+        # (но прямое обращение к боту всегда пробивает эту паузу)
+        if (not direct and ctx.rex_last_spoke <= 3
+                and ctx.rex_ignored == 0 and sig.aggression < 0.5):
             return True, "не_надоедать"
 
         # Слишком быстрый поток (>20 сообщений/мин) и это флуд — молчим
-        # Но не если это приветствие боту или упоминание
+        # Но не если это приветствие боту или прямое обращение
         if (ctx.msg_velocity > 20 and sig.is_flood
-                and not sig.has_bot_name and not sig.has_mention
-                and sig.topic != "приветствие"):
+                and not direct and sig.topic != "приветствие"):
             return True, "быстрый_поток_флуд"
 
         # ── ПЕРЕБОР: проверки из диалогового контекста ───────────
         dlg = ctx.dialogue_ctx
         if dlg is not None:
-            direct = sig.has_bot_name or sig.has_mention or sig.has_reply_bot
-
             # Принудительное охлаждение — молчать, только прямое обращение пробивает
             if dlg.bot_cooling_down and not direct:
                 return True, "охлаждение"

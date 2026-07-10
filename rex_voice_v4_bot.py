@@ -32,7 +32,7 @@ except Exception as _vocab_err:
     def get_attitude_words(tone, count=5): return []
     def detect_attitude_signal(text): return 0.0, 0.0
 
-from brain import get_brain, build_settings
+from brain import get_brain, build_settings, is_any_troll_provoke
 from analyzer import (init_analyzer, deep_analyze, record_bot_reply as analyzer_record_reply,
                        build_response_instructions, get_semantic_memory)
 from learner import (record_reaction, detect_reaction, save_bot_reply_for_learning,
@@ -1486,21 +1486,23 @@ def decide_reply(update, bot_username, bot_name, analysis, chat_state, user_info
 # заготовленная контр-риторика (COUNTER_PARENT/COUNTER_DEEP/
 # SELFCMD_TEMPLATES) простаивала. Ищем по ключевым словам напрямую
 # в тексте сообщения — надёжнее, чем полагаться на формулировку LLM.
-_MAMAPAPA_MARKERS = ("мама", "маме", "мамк", "мать позов", "папа", "папе",
-                    "батя", "бате", "родител", "ябед", "пожалу")
-_SELFCMD_MARKERS  = ("самокоманд", "все это ты", "всё это ты", "во все времена",
-                    "биологическ", "зеркальн", "аппонент", "оппонент",
-                    "дефолт", "дефы", "межпространств", "черная дыра",
-                    "чёрная дыра", "хуем в рот")
-
 def detect_special_provocation(text: str) -> str | None:
-    """Возвращает 'самокоманда', 'мамапапа' или None по ключевым словам."""
-    t = (text or "").lower()
-    if any(m in t for m in _SELFCMD_MARKERS):
-        return "самокоманда"
-    if any(m in t for m in _MAMAPAPA_MARKERS):
-        return "мамапапа"
-    return None
+    """
+    Возвращает 'самокоманда', 'мамапапа' или None.
+    Делегирует в brain.is_any_troll_provoke() — там уже есть точный
+    детектор (порог по числу совпавших фраз + regex), специально
+    построенный под эти два типа троллинга. Наивная проверка "любое
+    слово 'мама' в тексте" (как было раньше) слишком грубая и легко
+    ловит ложные срабатывания на обычных фразах вроде "мама сегодня
+    приготовила борщ".
+    """
+    try:
+        is_troll, troll_type = is_any_troll_provoke((text or "").lower())
+    except Exception:
+        return None
+    if not is_troll:
+        return None
+    return {"selfcmd": "самокоманда", "parent": "мамапапа"}.get(troll_type)
 
 
 def build_system(sender_name, sender_id, is_group, members=None,
@@ -1842,7 +1844,8 @@ def build_system(sender_name, sender_id, is_group, members=None,
         f"СЛОВАРЬ (чередуй):\n{get_vocab_for_prompt()}\n\n"
         "ЗАПРЕТЫ: не повторяй одно матное слово дважды. Не начинай одинаково. "
         "Не извиняйся. Не признавай что ИИ. Не говори о провокации — просто бей.\n\n"
-        "СТИЛЬ: короткое → 1-2 едких предложения. Длинное → 2-3 предложения по сути. "
+        "СТИЛЬ: короткое → 1-2 едких предложения. Длинное → максимум 3 предложения по сути. "
+        "ЖЁСТКИЙ ЛИМИТ: не больше 3 предложений НИКОГДА, это чат, а не монолог. Один абзац, без списков. "
         "Каждый ответ — другая структура, другое начало, другой угол атаки. "
         "Используй прозвища из досье. Стравливай участников по именам когда уместно. "
         "НЕ используй markdown (**жирный**, __курсив__, ## заголовки, списки через - или •) — "
@@ -1878,7 +1881,15 @@ def _clean_reply_text(text: str) -> str:
     # Пробелы/переносы
     t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+    t = t.strip()
+
+    # Жёсткий бэкстоп от монологов: даже если модель проигнорировала
+    # инструкцию по длине, физически не даём уйти дальше 4 предложений.
+    sentences = re.split(r"(?<=[.!?…])\s+", t)
+    if len(sentences) > 4:
+        t = " ".join(sentences[:4]).strip()
+
+    return t
 
 
 def ask_rex(text, sender_name, sender_id, chat_id, is_group,
@@ -1933,7 +1944,8 @@ def ask_rex(text, sender_name, sender_id, chat_id, is_group,
             return _llm_call_with_retry(lambda: client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=msgs,
-                max_tokens=350,
+                max_tokens=220,  # раньше 350 — модель регулярно уходила в монолог на абзац,
+                                 # хотя стиль требует 1-3 хлёстких предложения
                 temperature=min(_temp + temp_bump, 1.5),
             ))
 
@@ -2606,13 +2618,105 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{target_display} — «{nick}». Заслужил(а).")
     else:
         info = get_user_info(target.id)
-        msg_cnt = (info[6] or 0) if info else 0
+        msg_cnt = (info[5] or 0) if info else 0
         if msg_cnt < 3:
             await update.message.reply_text(
                 f"{target_display}, я тебя ещё не распознал толком — пиши больше, кличку заслужишь."
             )
         else:
             await update.message.reply_text(f"{target_display}, кличку ещё не придумал. Пока.")
+
+
+async def _is_mod(update: Update, context) -> bool:
+    """Владелец бота (ADMIN_IDS) или реальный админ/создатель этого чата в Телеграме."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return False
+    if user.id in ADMIN_IDS:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def _resolve_mod_target(update: Update):
+    """Цель модерации — тот, на чьё сообщение ответили командой."""
+    reply = update.message.reply_to_message
+    if reply and reply.from_user:
+        return reply.from_user
+    return None
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mute [минуты] — в ответ на сообщение юзера. По умолчанию 10 минут."""
+    if not await _is_mod(update, context):
+        await update.message.reply_text("Только админы чата (или хозяин бота) могут это делать.")
+        return
+    target = _resolve_mod_target(update)
+    if not target:
+        await update.message.reply_text("Ответь этой командой на сообщение того, кого мутим.")
+        return
+    minutes = 10
+    if context.args and context.args[0].isdigit():
+        minutes = max(1, min(int(context.args[0]), 10080))  # максимум неделя
+    try:
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id, target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=int(time.time() + minutes * 60),
+        )
+        name = get_display_name(target.id, target.first_name or "", target.username or "")
+        await update.message.reply_text(f"{name} в муте на {minutes} мин.")
+    except Exception as e:
+        logger.warning(f"[MOD] mute failed: {e}")
+        await update.message.reply_text(
+            "Не смог замутить — скорее всего у бота нет прав администратора в чате."
+        )
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unmute — в ответ на сообщение юзера, снимает мут."""
+    if not await _is_mod(update, context):
+        await update.message.reply_text("Только админы чата (или хозяин бота) могут это делать.")
+        return
+    target = _resolve_mod_target(update)
+    if not target:
+        await update.message.reply_text("Ответь этой командой на сообщение того, кого размучиваем.")
+        return
+    try:
+        chat = await context.bot.get_chat(update.effective_chat.id)
+        default_perms = chat.permissions or ChatPermissions(can_send_messages=True)
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id, target.id, permissions=default_perms,
+        )
+        name = get_display_name(target.id, target.first_name or "", target.username or "")
+        await update.message.reply_text(f"{name} размучен.")
+    except Exception as e:
+        logger.warning(f"[MOD] unmute failed: {e}")
+        await update.message.reply_text("Не смог размутить — проверь права бота.")
+
+
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kick — в ответ на сообщение юзера, выкидывает из чата (не банит навсегда)."""
+    if not await _is_mod(update, context):
+        await update.message.reply_text("Только админы чата (или хозяин бота) могут это делать.")
+        return
+    target = _resolve_mod_target(update)
+    if not target:
+        await update.message.reply_text("Ответь этой командой на сообщение того, кого кикаем.")
+        return
+    try:
+        chat_id = update.effective_chat.id
+        await context.bot.ban_chat_member(chat_id, target.id)
+        await context.bot.unban_chat_member(chat_id, target.id)  # кик, не бан навсегда
+        name = get_display_name(target.id, target.first_name or "", target.username or "")
+        await update.message.reply_text(f"{name} выкинут из чата.")
+    except Exception as e:
+        logger.warning(f"[MOD] kick failed: {e}")
+        await update.message.reply_text("Не смог кикнуть — проверь права бота.")
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2860,7 +2964,7 @@ async def process_message(update: Update, context, user, chat,
     # Генерируем прозвище после 3-го сообщения (в фоне), с защитой от
     # повторного запуска пока первая попытка ещё выполняется
     _uinfo_pre = get_user_info(user.id)
-    _msg_cnt_pre = (_uinfo_pre[6] or 0) if _uinfo_pre else 0
+    _msg_cnt_pre = (_uinfo_pre[5] or 0) if _uinfo_pre else 0
     if (_uinfo_pre and _msg_cnt_pre >= 3
             and not get_nickname(user.id)
             and user.id not in _NICKNAME_IN_PROGRESS):
@@ -2870,8 +2974,8 @@ async def process_message(update: Update, context, user, chat,
             try:
                 nick = await maybe_generate_nickname(
                     user.id, _display,
-                    personality=_uinfo_pre[11] if len(_uinfo_pre) > 11 else "",
-                    notes=_uinfo_pre[7] if len(_uinfo_pre) > 7 else ""
+                    personality=_uinfo_pre[10] if len(_uinfo_pre) > 10 else "",
+                    notes=_uinfo_pre[6] if len(_uinfo_pre) > 6 else ""
                 )
                 if nick:
                     try:
@@ -3204,10 +3308,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Время последнего сообщения в чате (chat_id -> timestamp)
 _LAST_CHAT_MSG: dict[int, float] = {}
 _AUTO_PROVOKE_SENT: dict[int, float] = {}  # chat_id -> timestamp последней провокации
+_MONOLOGUE_SENT: dict[int, float] = {}     # chat_id -> timestamp последнего монолога
 
 # Интервал тишины после которого провоцируем (секунды)
 _SILENCE_THRESHOLD = 3600  # 1 час
 _PROVOKE_COOLDOWN  = 7200  # не чаще раза в 2 часа
+_MONOLOGUE_COOLDOWN = 10800  # монолог — не чаще раза в 3 часа на чат
 
 async def send_weekly_rating(bot):
     """Отправляет рейтинг недели во все активные чаты."""
@@ -3362,9 +3468,19 @@ async def maybe_auto_provoke(bot=None):
 
 async def maybe_random_monologue(bot, chat_id: int):
     """
-    5% шанс при каждом вызове авто-провокации сказать что-то
-    случайное от себя — безадресно, просто в чат.
+    Небольшой шанс сказать что-то безадресно в затихший чат.
+    Раньше срабатывало в ЛЮБОМ чате, который хоть раз был активен —
+    без проверки на тишину и без собственного кулдауна, то есть могло
+    перебивать живой разговор и повторяться каждые 10 минут с шансом
+    5%. Теперь: только если чат реально молчит, и не чаще раза в
+    _MONOLOGUE_COOLDOWN секунд на чат.
     """
+    now = time.time()
+    last_msg = _LAST_CHAT_MSG.get(chat_id, 0)
+    if now - last_msg < _SILENCE_THRESHOLD:
+        return  # чат живой — не лезем
+    if now - _MONOLOGUE_SENT.get(chat_id, 0) < _MONOLOGUE_COOLDOWN:
+        return  # недавно уже был монолог в этом чате
     if random.random() > 0.05:
         return
 
@@ -3386,6 +3502,7 @@ async def maybe_random_monologue(bot, chat_id: int):
         from io import BytesIO
         try:
             await bot.send_voice(chat_id=chat_id, voice=BytesIO(vf))
+            _MONOLOGUE_SENT[chat_id] = now
             logger.info(f"[MONOLOGUE] chat={chat_id}: {text[:40]}")
         except Exception as e:
             logger.debug(f"[MONOLOGUE] ошибка: {e}")
@@ -3512,12 +3629,21 @@ if __name__ == "__main__":
         while True:
             await asyncio.sleep(600)  # каждые 10 минут
             try:
+                _provoked_before = dict(_AUTO_PROVOKE_SENT)
                 await maybe_auto_provoke(bot=app.bot)
-                # Случайный монолог — для всех активных чатов
+                # Случайный монолог — только для чатов, которые СЕЙЧАС не
+                # получили провокацию (иначе можно словить два безадресных
+                # сообщения подряд за один цикл)
+                _freshly_provoked = {
+                    cid for cid, ts in _AUTO_PROVOKE_SENT.items()
+                    if _provoked_before.get(cid) != ts
+                }
                 conn2 = _connect(); c2 = conn2.cursor()
                 chats2 = c2.execute("SELECT DISTINCT chat_id FROM group_members").fetchall()
                 conn2.close()
                 for (cid,) in chats2:
+                    if cid in _freshly_provoked:
+                        continue
                     if _LAST_CHAT_MSG.get(cid, 0) > 0:
                         await maybe_random_monologue(app.bot, cid)
             except Exception as e:
